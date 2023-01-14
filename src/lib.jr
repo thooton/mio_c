@@ -1,0 +1,591 @@
+use mio::{net::TcpListener, net::{TcpStream, UdpSocket}, Events, Interest, Poll, Token};
+use std::{
+    io::{ErrorKind, Read, Write},
+    net::{AddrParseError, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6, Ipv4Addr, Ipv6Addr},
+};
+
+const fn = quote(#[no_mangle] pub extern "C" fn);
+
+${quote(
+
+#[repr(C)]
+pub struct Mio {
+    poll: Poll,
+    events: Events
+}
+
+)}
+
+${fn} mio_new(evt_bufsz: u32, err: *mut u32) -> Mio {
+    let poll_maybe = Poll::new();
+    if poll_maybe.is_err() {
+        unsafe {
+            *err = 1;
+            return std::mem::zeroed();
+        }
+    }
+    unsafe { *err = 0; }
+    return Mio{
+        poll: poll_maybe.unwrap(),
+        events: Events::with_capacity(evt_bufsz as usize)
+    };
+}
+
+${quote(
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MioV4 {
+    ip: [u8; 4],
+    port: u16
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MioV6 {
+    flowinfo: u32,
+    scope_id: u32,
+    ip: [u16; 8],
+    port: u16
+}
+
+#[repr(C)]
+pub union MioSockAddrInner {
+    v4: MioV4,
+    v6: MioV6
+}
+
+#[repr(C)]
+pub struct MioSockAddr {
+    inner: MioSockAddrInner,
+    is_v4: u8
+}
+
+)}
+
+#[inline(always)]
+fn toRustAddr(sock_addr: MioSockAddr) -> SocketAddr {
+    if sock_addr.is_v4 != 0 {
+        unsafe {
+            return SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(
+                    sock_addr.inner.v4.ip
+                ),
+                sock_addr.inner.v4.port
+            ));
+        }
+    } else {
+        unsafe {
+            return SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(
+                    sock_addr.inner.v6.ip
+                ),
+                sock_addr.inner.v6.port,
+                sock_addr.inner.v6.flowinfo,
+                sock_addr.inner.v6.scope_id
+            ));
+        }
+    }
+}
+
+#[inline(always)]
+fn toCAddr(sock_addr: SocketAddr) -> MioSockAddr {
+    match sock_addr {
+        SocketAddr::V4(the_v4) => {
+            return MioSockAddr{
+                inner: MioSockAddrInner{
+                    v4: MioV4{
+                        ip: the_v4.ip().octets(),
+                        port: the_v4.port()
+                    }
+                },
+                is_v4: 1
+            };
+        },
+        SocketAddr::V6(the_v6) => {
+            return MioSockAddr{
+                inner: MioSockAddrInner{
+                    v6: MioV6{
+                        flowinfo: the_v6.flowinfo(),
+                        scope_id: the_v6.scope_id(),
+                        ip: the_v6.ip().segments(),
+                        port: the_v6.port()
+                    }
+                },
+                is_v4: 0
+            }
+        }
+    }
+}
+
+${fn} mio_sock_addr_from(addr: *const u8, addr_len: u32, err: *mut u32) -> MioSockAddr {
+    let addr_slice = unsafe {
+        core::slice::from_raw_parts(addr, addr_len as usize)
+    };
+    let addr_str_maybe = unsafe {
+        core::str::from_utf8(addr_slice)
+    };
+    if addr_str_maybe.is_err() {
+        unsafe {
+            *err = 1;
+            return std::mem::zeroed();
+        }
+    }
+    let sock_addr_maybe: Result<SocketAddr, AddrParseError> = addr_str_maybe.unwrap().parse();
+    if sock_addr_maybe.is_err() {
+        unsafe {
+            *err = 1;
+            return std::mem::zeroed();
+        }
+    }
+    unsafe { *err = 0; }
+    return toCAddr(sock_addr_maybe.unwrap());
+}
+
+${quote(
+
+#[repr(C)]
+pub struct MioTcpServer {
+    inner: TcpListener
+}
+
+)}
+
+${fn} mio_tcp_server_new(
+    sock_addr: MioSockAddr, err: *mut u32
+) -> MioTcpServer {
+    let server_maybe = TcpListener::bind(toRustAddr(sock_addr));
+    if server_maybe.is_err() {
+        unsafe {
+            *err = 1;
+            return std::mem::zeroed();
+        }
+    }
+    unsafe { *err = 0; }
+    return MioTcpServer{
+        inner: server_maybe.unwrap()
+    };
+}
+
+pub const MIO_READABLE: u32 = 1;
+pub const MIO_WRITABLE: u32 = 2;
+pub const MIO_CLOSED: u32 = 4;
+
+#[inline(always)]
+fn parseInterests(interests: u32) -> Interest {
+    let mut int = Interest::READABLE;
+    if (interests & MIO_WRITABLE) != 0 {
+        int |= Interest::WRITABLE;
+        if (interests & MIO_READABLE) == 0 {
+            int |= Interest::READABLE;
+        }
+    }
+    return int;
+}
+
+function sourceFor(unm, cnm, snm) {
+    function inner(kind) {
+        return quote(
+            ${fn} mio_${unm}_${kind}(
+                mio: *mut Mio, ${snm}: *mut ${cnm},
+                token: u32, interests: u32
+            ) -> u32 {
+                let res = unsafe {
+                    (*mio).poll.registry().${kind}(
+                        &mut ((*${snm}).inner), Token(token as usize),
+                        parseInterests(interests)
+                    )
+                };
+                if res.is_err() {
+                    return 1;
+                }
+                return 0;
+            }
+        )
+    }
+    return quote(
+        ${inner(quote(register))}
+        ${inner(quote(reregister))}
+        pub extern "C" fn mio_${unm}_deregister(
+            mio: *mut Mio, ${snm}: *mut ${cnm}
+        ) -> u32 {
+            let res = unsafe {
+                (*mio).poll.registry().deregister(
+                    &mut ((*${snm}).inner)
+                )
+            };
+            if res.is_err() {
+                return 1;
+            }
+            return 0;
+        }
+    )
+}
+
+${sourceFor(quote(tcp_server), quote(MioTcpServer), quote(server))}
+
+${quote(
+
+#[repr(C)]
+pub struct MioTcpClient {
+    inner: TcpStream
+}
+
+)}
+
+${fn} mio_tcp_client_new(
+    socket_addr: MioSockAddr, err: *mut u32
+) -> MioTcpClient {
+    let client_maybe = TcpStream::connect(toRustAddr(socket_addr));
+    if client_maybe.is_err() {
+        unsafe {
+            *err = 1;
+            return std::mem::zeroed();
+        }
+    }
+    unsafe { *err = 0; }
+    return MioTcpClient{
+        inner: client_maybe.unwrap()
+    };
+}
+
+${sourceFor(quote(tcp_client), quote(MioTcpClient), quote(client))}
+
+${fn} mio_tcp_server_accept(
+    server: *const MioTcpServer, err: *mut u32
+) -> MioTcpClient {
+    let res = unsafe { (*server).inner.accept() };
+    if res.is_err() {
+        unsafe {
+            *err = 1;
+            return std::mem::zeroed();
+        }
+    }
+    unsafe { *err = 0; }
+    return MioTcpClient{
+        inner: res.unwrap().0
+    }
+}
+
+function ttlFor(unm, cnm, snm) {
+    return quote(
+        #[no_mangle]
+        pub extern "C" fn mio_${unm}_set_ttl(
+            ${snm}: *const ${cnm}, ttl: u32
+        ) -> u32 {
+            let res = unsafe { (*${snm}).inner.set_ttl(ttl) };
+            if res.is_err() {
+                return 1;
+            }
+            return 0;
+        }
+
+        #[no_mangle]
+        pub extern "C" fn mio_${unm}_ttl(
+            ${snm}: *const ${cnm}, err: *mut u32
+        ) -> u32 {
+            let res = unsafe { (*${snm}).inner.ttl() };
+            if res.is_err() {
+                unsafe { *err = 1; }
+                return 0;
+            }
+            unsafe { *err = 0; }
+            return res.unwrap();
+        }
+    )
+}
+
+function mtcshutdown(kind) {
+    var lower = strtoq(kind);
+    var upper = strtoq(kind[0].toUpperCase()+kind.slice(1));
+    return quote(
+        #[no_mangle]
+        pub extern "C" fn mio_tcp_client_shutdown_${lower}(
+            client: *const MioTcpClient
+        ) -> u32 {
+            let res = unsafe { (*client).inner.shutdown(Shutdown::${upper}) };
+            if res.is_err() {
+                return 1;
+            }
+            return 0;
+        }
+    )
+}
+
+${ttlFor(quote(tcp_server), quote(MioTcpServer), quote(server))}
+${mtcshutdown("read")}
+${mtcshutdown("write")}
+${mtcshutdown("both")}
+
+${fn} mio_tcp_client_set_nodelay(
+    client: *const MioTcpClient, nodelay: u32
+) -> u32 {
+    let res = unsafe { (*client).inner.set_nodelay(nodelay != 0) };
+    if res.is_err() {
+        return 1;
+    }
+    return 0;
+}
+
+${fn} mio_tcp_client_get_nodelay(
+    client: *const MioTcpClient, err: *mut u32
+) -> u32 {
+    let res = unsafe { (*client).inner.nodelay() };
+    if res.is_err() {
+        unsafe { *err = 1; }
+        return 0;
+    }
+    unsafe { *err = 0; }
+    let nodelay = res.unwrap();
+    if nodelay {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+function mtcmoon(unm, snm, cnm, t, v, mb) {
+    return quote(
+        #[no_mangle]
+        pub extern "C" fn mio_${unm}_${v}(
+            ${snm}: *${t ? quote(mut) : quote(const)} ${cnm}, buf: *${mb ? quote(mut) : quote(const)} u8, buf_len: u32, err: *mut u32
+        ) -> u32 {
+            let ${snm}_ref = unsafe { &${t ? quote(mut) : quote()} *${snm} };
+            let sl = unsafe {
+                core::slice::from_raw_parts${mb ? quote(_mut) : quote()}(buf, buf_len as usize)
+            };
+            loop {
+                let res = ${snm}_ref.inner.${v}(sl);
+                match res {
+                    Ok(amt) => {
+                        unsafe { *err = 0; }
+                        return amt as u32;
+                    },
+                    Err(e) => {
+                        if e.kind() != ErrorKind::Interrupted {
+                            unsafe { *err = 1; }
+                            return 0;
+                        }
+                    }
+                }
+            }
+        }
+    );
+}
+
+${ttlFor(quote(tcp_client), quote(MioTcpClient), quote(client))}
+${mtcmoon(quote(tcp_client), quote(client), quote(MioTcpClient), false, quote(peek), true)}
+${mtcmoon(quote(tcp_client), quote(client), quote(MioTcpClient), true, quote(read), true)}
+${mtcmoon(quote(tcp_client), quote(client), quote(MioTcpClient), true, quote(write), false)}
+/*
+${fn} mio_tcp_client_read_exact(
+    client: *mut MioTcpClient, dst: *mut u8, dst_len: u32
+) -> u32 {
+    let client_ref = unsafe { &mut *client };
+    let dstsl = unsafe { 
+        core::slice::from_raw_parts_mut(dst, dst_len as usize)
+    };
+    let res = client_ref.inner.read_exact(dstsl);
+    if res.is_err() {
+        return 1;
+    }
+    return 0;
+}
+
+${fn} mio_tcp_client_write_all(
+    client: *mut MioTcpClient, src: *const u8, src_len: u32
+) -> u32 {
+    let client_ref = unsafe { &mut *client };
+    let sl = unsafe { 
+        core::slice::from_raw_parts(src, src_len as usize)
+    };
+    let res = client_ref.inner.write_all(sl);
+    if res.is_err() {
+        return 1;
+    }
+    return 0;
+}*/
+
+${fn} mio_tcp_client_flush(
+    client: *mut MioTcpClient
+) -> u32 {
+    let res = unsafe { (*client).inner.flush() };
+    if res.is_err() {
+        return 1;
+    }
+    return 0;
+}
+
+function socketAddrFn(meth, unm, snm, cnm) {
+    return quote(
+        ${fn} mio_${unm}_${meth}(
+            ${snm}: *mut ${cnm},
+            err: *mut u32
+        ) -> MioSockAddr {
+            let res = unsafe { (*${snm}).inner.${meth}() };
+            if res.is_err() {
+                unsafe {
+                    *err = 1;
+                    return std::mem::zeroed();
+                }
+            }
+            unsafe { *err = 0; }
+            return toCAddr(res.unwrap());
+        }
+    );
+}
+
+${socketAddrFn(quote(local_addr), quote(tcp_client), quote(client), quote(MioTcpClient))}
+${socketAddrFn(quote(peer_addr), quote(tcp_client), quote(client), quote(MioTcpClient))}
+${socketAddrFn(quote(local_addr), quote(tcp_server), quote(server), quote(MioTcpServer))}
+
+${quote(
+
+#[repr(C)]
+pub struct MioUdpSocket {
+    inner: UdpSocket
+}
+
+)}
+
+${fn} mio_udp_socket_new(
+    sock_addr: MioSockAddr,
+    err: *mut u32
+) -> MioUdpSocket {
+    let sock_maybe = UdpSocket::bind(toRustAddr(sock_addr));
+    if sock_maybe.is_err() {
+        unsafe {
+            *err = 1;
+            return std::mem::zeroed();
+        }
+    }
+    unsafe { *err = 0; }
+    return MioUdpSocket{
+        inner: sock_maybe.unwrap()
+    };
+}
+
+${fn} mio_udp_socket_connect(
+    socket: *const MioUdpSocket,
+    sock_addr: MioSockAddr
+) -> u32 {
+    let res = unsafe { (*socket).inner.connect(toRustAddr(sock_addr)) };
+    if res.is_err() {
+        return 1;
+    }
+    return 0;
+}
+
+function musFrom(meth) {
+    return quote(
+        ${fn} mio_udp_socket_${meth}(
+            socket: *const MioUdpSocket,
+            dst: *mut u8,
+            dst_len: u32,
+            amt: *mut u32,
+            err: *mut u32
+        ) -> MioSockAddr {
+            let sl = unsafe {
+                core::slice::from_raw_parts_mut(dst, dst_len as usize)
+            };
+            loop {
+                let res = unsafe { (*socket).inner.${meth}(sl) };
+                match res {
+                    Ok((amount, addr)) => {
+                        unsafe {
+                            *err = 0;
+                            *amt = amount as u32;
+                        }
+                        return toCAddr(addr);
+                    },
+                    Err(e) => {
+                        if e.kind() != ErrorKind::Interrupted {
+                            unsafe {
+                                *err = 1;
+                                return std::mem::zeroed();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    )
+}
+
+${socketAddrFn(quote(local_addr), quote(udp_socket), quote(socket), quote(MioUdpSocket))}
+${socketAddrFn(quote(peer_addr), quote(udp_socket), quote(socket), quote(MioUdpSocket))}
+${ttlFor(quote(udp_socket), quote(MioUdpSocket), quote(socket))}
+
+${mtcmoon(quote(udp_socket), quote(socket), quote(MioUdpSocket), false, quote(peek), true)}
+${mtcmoon(quote(udp_socket), quote(socket), quote(MioUdpSocket), true, quote(recv), true)}
+${mtcmoon(quote(udp_socket), quote(socket), quote(MioUdpSocket), true, quote(send), false)}
+
+${musFrom(quote(recv_from))}
+${musFrom(quote(peek_from))}
+
+${sourceFor(quote(udp_socket), quote(MioUdpSocket), quote(socket))}
+
+${fn} mio_udp_socket_send_to(
+    socket: *const MioUdpSocket,
+    src: *const u8,
+    src_len: u32,
+    target: MioSockAddr,
+    err: *mut u32
+) -> u32 {
+    let sl = unsafe {
+        core::slice::from_raw_parts(src, src_len as usize)
+    };
+    let addr = toRustAddr(target);
+    loop {
+        let res = unsafe { (*socket).inner.send_to(sl, addr) };
+        match res {
+            Ok(amt) => {
+                unsafe { *err = 0; }
+                return amt as u32;
+            },
+            Err(e) => {
+                if e.kind() != ErrorKind::Interrupted {
+                    unsafe {
+                        *err = 1;
+                        return std::mem::zeroed();
+                    }
+                }
+            }
+        }
+    }
+}
+
+${fn} mio_poll(
+    mio: *mut Mio, 
+    callback: unsafe extern "C" fn(*mut u8, u32, u32),
+    userdata: *mut u8
+) -> u32 {
+    let mio_ref = unsafe { &mut *mio };
+    loop {
+        match mio_ref.poll.poll(&mut mio_ref.events, None) {
+            Err(e) => {
+                if e.kind() != ErrorKind::Interrupted {
+                    return 1;
+                }
+            },
+            Ok(_) => break
+        };
+    }
+    for event in mio_ref.events.iter() {
+        let tok = event.token().0 as u32;
+        let mut flags: u32;
+        if event.is_error() || event.is_read_closed() {
+            flags = MIO_CLOSED;
+        } else {
+            flags = 0;
+            if event.is_readable() {
+                flags |= MIO_READABLE;
+            }
+            if event.is_writable() {
+                flags |= MIO_WRITABLE;
+            }
+        }
+        unsafe { callback(userdata, tok, flags); }
+    }
+    return 0;
+}

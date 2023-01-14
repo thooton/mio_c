@@ -1,0 +1,15 @@
+[package]
+name = "mio_c"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mio_c"
+crate-type = ["staticlib"]
+
+[dependencies]
+mio = { version = "0.8.5", features = ["os-poll", "net"] }
+
+[build-dependencies]
+mio = { version = "0.8.5", features = ["os-poll", "net"] }
+cbindgen = "0.20.0"
