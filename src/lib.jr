@@ -173,12 +173,15 @@ pub const MIO_CLOSED: u32 = 4;
 
 #[inline(always)]
 fn parseInterests(interests: u32) -> Interest {
-    let mut int = Interest::READABLE;
+    let mut int;
     if (interests & MIO_WRITABLE) != 0 {
-        int |= Interest::WRITABLE;
-        if (interests & MIO_READABLE) == 0 {
-            int |= Interest::READABLE;
+        if (interests & MIO_READABLE) != 0 {
+            int = Interest::READABLE|Interest::WRITABLE;
+        } else {
+            int = Interest::WRITABLE;
         }
+    } else {
+        int = Interest::READABLE;
     }
     return int;
 }
